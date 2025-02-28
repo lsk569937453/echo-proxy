@@ -11,6 +11,7 @@ use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+
 use tracing_appender::rolling;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -33,7 +34,48 @@ struct Cli {
     )]
     target_url: String,
 }
-
+#[derive(Debug)]
+struct HttpInfo {
+    pub request_http_headers: HashMap<String, String>,
+    pub url: String,
+    pub method: String,
+    pub request_http_body: String,
+    pub response_http_headers: HashMap<String, String>,
+    pub response_http_body: String,
+    pub error_message: String,
+}
+impl HttpInfo {
+    pub fn new(
+        request_http_headers: HashMap<String, String>,
+        request_http_body: String,
+        response_http_headers: HashMap<String, String>,
+        response_http_body: String,
+        error_message: String,
+        url: String,
+        method: String,
+    ) -> Self {
+        HttpInfo {
+            request_http_headers,
+            request_http_body,
+            response_http_headers,
+            response_http_body,
+            error_message,
+            url,
+            method,
+        }
+    }
+    pub fn empty() -> Self {
+        HttpInfo {
+            request_http_headers: HashMap::new(),
+            request_http_body: "".to_string(),
+            response_http_headers: HashMap::new(),
+            response_http_body: "".to_string(),
+            error_message: "".to_string(),
+            url: "".to_string(),
+            method: "".to_string(),
+        }
+    }
+}
 fn convert(headers: &HeaderMap<HeaderValue>) -> HashMap<String, String> {
     let mut header_hashmap = HashMap::new();
     for (k, v) in headers {
@@ -47,38 +89,50 @@ async fn echo_with_error(
     req: Request<hyper::body::Incoming>,
     remote_ip: String,
     target_url: String,
-) -> Result<Response<Incoming>, anyhow::Error> {
-    let res = echo(req, remote_ip.clone(), target_url).await;
+) -> Result<Response<Full<Bytes>>, anyhow::Error> {
+    let mut http_info = HttpInfo::empty();
+    let res = echo(req, remote_ip.clone(), target_url, &mut http_info).await;
     match res {
         Ok(res) => Ok(res),
         Err(err) => {
-            info!("Error serving connection: {:?},addr is:{:}", err, remote_ip);
+            http_info.error_message = err.to_string();
             Err(err)
         }
     }
+}
+fn string_to_incoming(s: String) -> Full<Bytes> {
+    let bytes = Bytes::from(s);
+
+    Full::<Bytes>::from(bytes)
 }
 #[instrument]
 async fn echo(
     req: Request<hyper::body::Incoming>,
     remote_ip: String,
     target_url: String,
-) -> Result<Response<Incoming>, anyhow::Error> {
-    info!("Received a request from {}", remote_ip);
+    http_info: &mut HttpInfo,
+) -> Result<Response<Full<Bytes>>, anyhow::Error> {
     let uri = req.uri().clone();
     let path = uri.path().to_string();
-    let hash_map = convert(req.headers());
-    let mut result_map = HashMap::new();
-    result_map.insert("headers", format!("{:?}", hash_map));
-    result_map.insert("path", format!("{:?}", path));
-    info!("{:?}", result_map);
+    let request_headers = convert(req.headers());
+    http_info.request_http_headers = request_headers;
+
     let (mut req, b) = req.into_parts();
+    let collected_bytes = b.collect().await?.to_bytes();
+    let bytes_vec = collected_bytes.to_vec();
+    let request_body = String::from_utf8(bytes_vec)?;
+    http_info.request_http_body = request_body.clone();
+    http_info.url = target_url.clone();
+    http_info.method = req.method.to_string();
+    let new_body = string_to_incoming(request_body.clone());
+
     req.uri = target_url.parse().unwrap();
     let host = req.uri.host().expect("uri has no host");
     let port = req.uri.port_u16().unwrap_or(80);
     let addr = format!("{}:{}", host, port);
-    let client_stream = TcpStream::connect(addr).await.unwrap();
+    let client_stream = TcpStream::connect(addr).await?;
     let io = TokioIo::new(client_stream);
-    let req = Request::from_parts(req, b);
+    let req = Request::from_parts(req, new_body);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::task::spawn(async move {
         if let Err(err) = conn.await {
@@ -87,13 +141,15 @@ async fn echo(
     });
 
     let res = sender.send_request(req).await?;
-    info!("res code:{},header:{:?}", res.status(), res.headers());
+    let (parts, body) = res.into_parts();
+    let c = body.collect().await?.to_bytes();
+    let response_string = String::from_utf8_lossy(&c);
+    let response_header = convert(&parts.headers);
+    http_info.response_http_headers = response_header;
+    http_info.response_http_body = response_string.to_string();
+    let body = Full::new(c);
+    let res = Response::from_parts(parts, body);
     Ok(res)
-
-    // let body = full(format!("{:?}", result_map));
-    // Response::builder()
-    //     .header("Connection", "keep-alive")
-    //     .body(body)
 }
 
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
@@ -149,7 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await
             {
-                info!("Error serving connection: {:?},addr is:{:}", err, addr_str);
+                // info!("Error serving connection: {:?},addr is:{:}", err, addr_str);
             }
         });
     }
