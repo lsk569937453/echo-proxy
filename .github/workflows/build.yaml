@@ -1,60 +1,88 @@
-name: Build with Cross
+name: "release"
 
+# This will trigger the action on each push to the `release` branch.
 on:
   push:
-    branches:
-      - main
-    tags-ignore:
-      - "precious-*"
-  pull_request:
-    branches:
-      - main
+    tags:
+      - "*"
 
+permissions:
+  contents: write
+  packages: write
 jobs:
   release:
-    name: Release - ${{ matrix.platform.os-name }}
     strategy:
       matrix:
         platform:
-          - os-name: FreeBSD-x86_64
-            runs-on: ubuntu-24.04
-            target: x86_64-unknown-freebsd
+          - release_for: linux-x86_64
+            os: ubuntu-20.04
+            target: x86_64-unknown-linux-gnu
+            bin: echo-proxy
+            name: echo-proxy-x86_64-unknown-linux-gnu
+            command: build
 
-          - os-name: Linux-x86_64
-            runs-on: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-
-          - os-name: Linux-aarch64
-            runs-on: ubuntu-24.04
-            target: aarch64-unknown-linux-musl
-
-          - os-name: Linux-riscv64
-            runs-on: ubuntu-24.04
-            target: riscv64gc-unknown-linux-gnu
-
-          - os-name: Windows-x86_64
-            runs-on: windows-latest
+          - release_for: Windows-x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
+            bin: echo-proxy.exe
+            name: echo-proxy-Windows-x86_64.exe
+            command: build
 
-          - os-name: macOS-x86_64
-            runs-on: macOS-latest
+          - release_for: macOS-x86_64
+            os: macOS-latest
             target: x86_64-apple-darwin
+            bin: echo-proxy
+            name: echo-proxy-Darwin-x86_64
+            command: build
+          - release_for: macOS-arm64
+            os: macOS-latest
+            target: aarch64-apple-darwin
+            bin: echo-proxy
+            name: echo-proxy-aarch64-apple-darwin
+            command: build
 
-          # more targets here
-
-    runs-on: ${{ matrix.platform.runs-on }}
+    runs-on: ${{ matrix.platform.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
       - name: Build binary
-        uses: houseabsolute/actions-rust-cross@v1
+        uses: houseabsolute/actions-rust-cross@v0
         with:
-          command: build
+          command: ${{ matrix.platform.command }}
           target: ${{ matrix.platform.target }}
-          args: "--locked --release"
+          args: "--release"
           strip: true
-      - name: Publish artifacts and release
-        uses: houseabsolute/actions-rust-release@v0
+      - name: "Login to GitHub Container Registry"
+        if: matrix.platform.target == 'x86_64-unknown-linux-gnu'
+        uses: docker/login-action@v1
         with:
-          executable-name: echo-proxy
-          target: ${{ matrix.platform.target }}
+          registry: ghcr.io
+          username: ${{github.actor}}
+          password: ${{secrets.GITHUB_TOKEN}}
+      - name: Build the docker image
+        if: matrix.platform.target == 'x86_64-unknown-linux-gnu'
+        run: |-
+          cp target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} ./docker/echo-proxy
+          cd docker/
+          docker build -t ghcr.io/lsk569937453/echo-proxy:${{ github.ref_name }} .
+          docker push ghcr.io/lsk569937453/echo-proxy:${{ github.ref_name }}
+
+      - name: Upload binaries to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
+          asset_name: ${{ matrix.platform.name }}
+          tag: ${{ github.ref }}
+          # draft: true
+        #   - name: 'Login to GitHub Container Registry'
+        #   uses: docker/login-action@v1
+        #   with:
+        #     registry: ghcr.io
+        #     username: ${{github.actor}}
+        #     password: ${{secrets.GITHUB_TOKEN}}
+
+        # - name: 'Build Inventory Image'
+        #   run: |
+        #     docker build . --tag ghcr.io/<your-GitHub-username>/store:latest
+        #     docker push ghcr.io/<your-GitHub-username>/store:latest
