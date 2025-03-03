@@ -9,24 +9,50 @@ on:
       - main
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  release:
+    name: Release - ${{ matrix.platform.os-name }}
     strategy:
       matrix:
-        target:
-          [x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu, x86_64-apple-darwin]
+        platform:
+          - os-name: FreeBSD-x86_64
+            runs-on: ubuntu-24.04
+            target: x86_64-unknown-freebsd
+
+          - os-name: Linux-x86_64
+            runs-on: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+
+          - os-name: Linux-aarch64
+            runs-on: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+
+          - os-name: Linux-riscv64
+            runs-on: ubuntu-24.04
+            target: riscv64gc-unknown-linux-gnu
+
+          - os-name: Windows-x86_64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+
+          - os-name: macOS-x86_64
+            runs-on: macOS-latest
+            target: x86_64-apple-darwin
+
+          # more targets here ...
+
+    runs-on: ${{ matrix.platform.runs-on }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Install cross
-        run: cargo install cross
-
-      - name: Build for ${{ matrix.target }}
-        run: cross build --target ${{ matrix.target }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build binary
+        uses: houseabsolute/actions-rust-cross@v1
         with:
-          name: build-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/
+          command: ${{ matrix.platform.command }}
+          target: ${{ matrix.platform.target }}
+          args: "--locked --release"
+          strip: true
+      - name: Publish artifacts and release
+        uses: houseabsolute/actions-rust-release@v0
+        with:
+          executable-name: echo-proxy
+          target: ${{ matrix.platform.target }}
