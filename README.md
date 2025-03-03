@@ -1,5 +1,3 @@
-1.https://youtube.com/shorts/1MFvISGFKxM?feature=share
-
 # Echo Proxy
 
 ## Introduction
