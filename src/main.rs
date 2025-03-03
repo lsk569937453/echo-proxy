@@ -1,3 +1,4 @@
+use crate::vojo::http_info::ResEnum::Er;
 use bytes::Bytes;
 use clap::Parser;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -6,6 +7,7 @@ use hyper::header::HeaderValue;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::HeaderMap;
+use hyper::StatusCode;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
@@ -15,8 +17,13 @@ use tokio::net::TcpStream;
 use tracing_appender::rolling;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
-
+mod vojo;
+use crate::vojo::http_info::Res;
+use crate::vojo::http_info::ResEnum::Common;
 use tracing_subscriber::layer::SubscriberExt;
+use vojo::http_info::HttpInfo;
+#[macro_use]
+extern crate anyhow;
 #[macro_use]
 extern crate tracing;
 #[derive(Parser)]
@@ -34,48 +41,7 @@ struct Cli {
     )]
     target_url: String,
 }
-#[derive(Debug)]
-struct HttpInfo {
-    pub request_http_headers: HashMap<String, String>,
-    pub url: String,
-    pub method: String,
-    pub request_http_body: String,
-    pub response_http_headers: HashMap<String, String>,
-    pub response_http_body: String,
-    pub error_message: String,
-}
-impl HttpInfo {
-    pub fn new(
-        request_http_headers: HashMap<String, String>,
-        request_http_body: String,
-        response_http_headers: HashMap<String, String>,
-        response_http_body: String,
-        error_message: String,
-        url: String,
-        method: String,
-    ) -> Self {
-        HttpInfo {
-            request_http_headers,
-            request_http_body,
-            response_http_headers,
-            response_http_body,
-            error_message,
-            url,
-            method,
-        }
-    }
-    pub fn empty() -> Self {
-        HttpInfo {
-            request_http_headers: HashMap::new(),
-            request_http_body: "".to_string(),
-            response_http_headers: HashMap::new(),
-            response_http_body: "".to_string(),
-            error_message: "".to_string(),
-            url: "".to_string(),
-            method: "".to_string(),
-        }
-    }
-}
+
 fn convert(headers: &HeaderMap<HeaderValue>) -> HashMap<String, String> {
     let mut header_hashmap = HashMap::new();
     for (k, v) in headers {
@@ -93,10 +59,20 @@ async fn echo_with_error(
     let mut http_info = HttpInfo::empty();
     let res = echo(req, remote_ip.clone(), target_url, &mut http_info).await;
     match res {
-        Ok(res) => Ok(res),
+        Ok(res) => {
+            println!("{}", serde_json::to_string_pretty(&http_info).unwrap());
+            Ok(res)
+        }
         Err(err) => {
-            http_info.error_message = err.to_string();
-            Err(err)
+            let res_enum = Er(err.to_string());
+            http_info.response = Res::new(res_enum);
+            println!("{}", serde_json::to_string_pretty(&http_info).unwrap());
+            let body = string_to_incoming(err.to_string());
+            let response = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(body)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok(response)
         }
     }
 }
@@ -114,19 +90,27 @@ async fn echo(
 ) -> Result<Response<Full<Bytes>>, anyhow::Error> {
     let uri = req.uri().clone();
     let path = uri.path().to_string();
+    let target_uri_string = format!(
+        "{}{}",
+        target_url,
+        uri.path_and_query().map(|x| x.as_str()).unwrap_or("/")
+    );
+    println!("target url is: {}", target_uri_string);
     let request_headers = convert(req.headers());
-    http_info.request_http_headers = request_headers;
+    http_info.request.headers = request_headers;
 
     let (mut req, b) = req.into_parts();
     let collected_bytes = b.collect().await?.to_bytes();
     let bytes_vec = collected_bytes.to_vec();
     let request_body = String::from_utf8(bytes_vec)?;
-    http_info.request_http_body = request_body.clone();
-    http_info.url = target_url.clone();
-    http_info.method = req.method.to_string();
-    let new_body = string_to_incoming(request_body.clone());
+    http_info.request.body = request_body.clone();
+    http_info.request.url = uri.to_string();
+    http_info.request.method = req.method.to_string();
 
-    req.uri = target_url.parse().unwrap();
+    let new_body = string_to_incoming(request_body.clone());
+    req.headers
+        .append("host", HeaderValue::from_static("httpbin.org"));
+    req.uri = target_uri_string.parse().unwrap();
     let host = req.uri.host().expect("uri has no host");
     let port = req.uri.port_u16().unwrap_or(80);
     let addr = format!("{}:{}", host, port);
@@ -139,14 +123,21 @@ async fn echo(
             println!("Connection failed: {:?}", err);
         }
     });
+    let res = sender
+        .send_request(req)
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
 
-    let res = sender.send_request(req).await?;
+    let status_code = res.status().as_u16();
+    println!("status code is: {}", status_code);
     let (parts, body) = res.into_parts();
     let c = body.collect().await?.to_bytes();
-    let response_string = String::from_utf8_lossy(&c);
+    let response_string = String::from_utf8_lossy(&c).to_string();
     let response_header = convert(&parts.headers);
-    http_info.response_http_headers = response_header;
-    http_info.response_http_body = response_string.to_string();
+    let common_response =
+        vojo::http_info::CommonResponse::new(response_header, response_string, status_code as i32);
+    let response = Res::new(Common(common_response));
+    http_info.response = response;
     let body = Full::new(c);
     let res = Response::from_parts(parts, body);
     Ok(res)
