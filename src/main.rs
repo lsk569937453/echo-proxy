@@ -34,7 +34,7 @@ struct Cli {
     http_port: u32,
 
     #[arg(
-        default_value_t = String::from("http://127.0.0.1:80"),
+        default_value_t = String::from("http://127.0.0.1:8080"),
         short = 'T',
         long = "target_url",
         value_name = "Target Url"
@@ -176,8 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!(r#"0.0.0.0:{port}"#);
     let target_url = cli.target_url;
     let listener = TcpListener::bind(&addr).await?;
-    info!("Listening on http://{}", addr);
-    println!("Listening on http://{}", addr);
+    info!("Listening on http://{},target url:{}", addr, target_url);
+    // println!("Listening on http://{},target url:{}", addr, target_url);
 
     loop {
         let (stream, addr) = listener.accept().await?;
