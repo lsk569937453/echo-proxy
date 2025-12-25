@@ -60,13 +60,19 @@ async fn echo_with_error(
     let res = echo(req, remote_ip.clone(), target_url, &mut http_info).await;
     match res {
         Ok(res) => {
-            println!("{}", serde_json::to_string_pretty(&http_info).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&http_info).unwrap_or_default()
+            );
             Ok(res)
         }
         Err(err) => {
             let res_enum = Er(err.to_string());
             http_info.response = Res::new(res_enum);
-            println!("{}", serde_json::to_string_pretty(&http_info).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&http_info).unwrap_or_default()
+            );
             let body = string_to_incoming(err.to_string());
             let response = Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -110,8 +116,8 @@ async fn echo(
     let new_body = string_to_incoming(request_body.clone());
     req.headers
         .append("host", HeaderValue::from_static("httpbin.org"));
-    req.uri = target_uri_string.parse().unwrap();
-    let host = req.uri.host().expect("uri has no host");
+    req.uri = target_uri_string.parse().unwrap_or_default();
+    let host = req.uri.host().unwrap_or_default();
     let port = req.uri.port_u16().unwrap_or(80);
     let addr = format!("{}:{}", host, port);
     let client_stream = TcpStream::connect(addr).await?;
