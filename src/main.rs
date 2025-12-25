@@ -10,9 +10,13 @@ use hyper::HeaderMap;
 use hyper::StatusCode;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use rustls::ServerConfig;
+use rustls_pemfile;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio_rustls::TlsAcceptor;
 
 use tracing_appender::rolling;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -29,12 +33,12 @@ extern crate tracing;
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Cli {
-    /// The http port,default port is 80
-    #[arg(default_value_t = 80, short = 'P', long = "port", value_name = "Port")]
-    http_port: u32,
+    /// The https port,default port is 443
+    #[arg(default_value_t = 443, short = 'P', long = "port", value_name = "Port")]
+    https_port: u32,
 
     #[arg(
-        default_value_t = String::from("http://127.0.0.1:8080"),
+        default_value_t = String::from("https://127.0.0.1:8080"),
         short = 'T',
         long = "target_url",
         value_name = "Target Url"
@@ -95,7 +99,6 @@ async fn echo(
     http_info: &mut HttpInfo,
 ) -> Result<Response<Full<Bytes>>, anyhow::Error> {
     let uri = req.uri().clone();
-    let path = uri.path().to_string();
     let target_uri_string = format!(
         "{}{}",
         target_url,
@@ -117,22 +120,20 @@ async fn echo(
     req.headers
         .append("host", HeaderValue::from_static("httpbin.org"));
     req.uri = target_uri_string.parse().unwrap_or_default();
-    let host = req.uri.host().unwrap_or_default();
-    let port = req.uri.port_u16().unwrap_or(80);
+
+    let is_https = req.uri.scheme().map(|s| s.as_str()) == Some("https");
+    let host = req.uri.host().unwrap_or_default().to_string();
+    let port = req
+        .uri
+        .port_u16()
+        .unwrap_or(if is_https { 443 } else { 80 });
     let addr = format!("{}:{}", host, port);
-    let client_stream = TcpStream::connect(addr).await?;
-    let io = TokioIo::new(client_stream);
-    let req = Request::from_parts(req, new_body);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
-        }
-    });
-    let res = sender
-        .send_request(req)
-        .await
-        .map_err(|e| anyhow!(e.to_string()))?;
+
+    let res = if is_https {
+        send_https_request(req, new_body, &addr, &host).await?
+    } else {
+        send_http_request(req, new_body, &addr).await?
+    };
 
     let status_code = res.status().as_u16();
     println!("status code is: {}", status_code);
@@ -149,10 +150,93 @@ async fn echo(
     Ok(res)
 }
 
+async fn send_http_request(
+    req: http::request::Parts,
+    body: Full<Bytes>,
+    addr: &str,
+) -> Result<Response<Incoming>, anyhow::Error> {
+    let stream = TcpStream::connect(addr).await?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+    let req = Request::from_parts(req, body);
+    let res = sender
+        .send_request(req)
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
+    Ok(res)
+}
+
+async fn send_https_request(
+    req: http::request::Parts,
+    body: Full<Bytes>,
+    addr: &str,
+    host: &str,
+) -> Result<Response<Incoming>, anyhow::Error> {
+    use rustls::pki_types::ServerName;
+    use rustls::ClientConfig;
+    use rustls::RootCertStore;
+    use rustls_native_certs::load_native_certs;
+    use tokio_rustls::TlsConnector;
+
+    let mut root_store = RootCertStore::empty();
+    let cert_results = load_native_certs();
+    for cert in cert_results.certs {
+        root_store.add(cert).ok();
+    }
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let stream = TcpStream::connect(addr).await?;
+    let server_name = ServerName::try_from(host.to_string())?;
+    let tls_stream = connector.connect(server_name, stream).await?;
+    let io = TokioIo::new(tls_stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+    let req = Request::from_parts(req, body);
+    let res = sender
+        .send_request(req)
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
+    Ok(res)
+}
+
 fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
     Full::new(chunk.into())
         .map_err(|never| match never {})
         .boxed()
+}
+
+fn generate_self_signed_cert() -> Result<(ServerConfig, String), anyhow::Error> {
+    use rcgen::generate_simple_self_signed;
+
+    let certified_key = generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let cert_pem = certified_key.cert.pem();
+    let key_pem = certified_key.key_pair.serialize_pem();
+
+    let mut cert_buf = cert_pem.as_bytes();
+    let cert_chain_option = rustls_pemfile::certs(&mut cert_buf).next();
+    let Some(Ok(cert_chain)) = cert_chain_option else {
+        return Err(anyhow!("can not find cert chain"));
+    };
+    let private_key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to read private key: {}", e))?
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_chain], private_key)?;
+
+    Ok((config, cert_pem.to_string()))
 }
 fn setup_logger() -> Result<(), anyhow::Error> {
     let app_file = rolling::daily("./logs", "access.log");
@@ -178,20 +262,33 @@ fn setup_logger() -> Result<(), anyhow::Error> {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     setup_logger()?;
     let cli: Cli = Cli::parse();
-    let port = cli.http_port;
+    let port = cli.https_port;
     let addr = format!(r#"0.0.0.0:{port}"#);
     let target_url = cli.target_url;
+
+    let (tls_config, cert_pem) = generate_self_signed_cert()?;
+    info!("Generated self-signed certificate:\n{}", cert_pem);
+
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
     let listener = TcpListener::bind(&addr).await?;
-    info!("Listening on http://{},target url:{}", addr, target_url);
-    // println!("Listening on http://{},target url:{}", addr, target_url);
+    info!("Listening on https://{}, target url:{}", addr, target_url);
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let addr_str = addr.to_string();
         let addr_str_clone = addr_str.clone();
         let target_url_cloned = target_url.clone();
-        let io = TokioIo::new(stream);
+        let tls_acceptor = tls_acceptor.clone();
+
         tokio::spawn(async move {
+            let tls_stream = match tls_acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("TLS handshake error: {:?}", e);
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
             if let Err(err) = http1::Builder::new()
                 .keep_alive(true)
                 .serve_connection(
@@ -202,7 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await
             {
-                // info!("Error serving connection: {:?},addr is:{:}", err, addr_str);
+                error!("Error serving connection: {:?}, addr is:{}", err, addr_str);
             }
         });
     }
